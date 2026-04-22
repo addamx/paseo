@@ -47,8 +47,8 @@ function createDeps(
 
 describe("agent metadata generator auto-title", () => {
   it("caps generated auto titles at 40 characters before persisting", async () => {
-    const setTitle = vi.fn().mockResolvedValue(undefined);
-    const manager = { setTitle } as unknown as AgentManager;
+    const setGeneratedTitleIfUnset = vi.fn().mockResolvedValue(undefined);
+    const manager = { setGeneratedTitleIfUnset } as unknown as AgentManager;
     const generatedTitle = "x".repeat(MAX_AUTO_AGENT_TITLE_CHARS + 25);
     const generateStructured = vi.fn().mockResolvedValue({ title: generatedTitle }) as NonNullable<
       AgentMetadataGeneratorDeps["generateStructuredAgentResponseWithFallback"]
@@ -64,13 +64,16 @@ describe("agent metadata generator auto-title", () => {
       deps: createDeps(generateStructured),
     });
 
-    expect(setTitle).toHaveBeenCalledTimes(1);
-    expect(setTitle).toHaveBeenCalledWith("agent-1", "x".repeat(MAX_AUTO_AGENT_TITLE_CHARS));
+    expect(setGeneratedTitleIfUnset).toHaveBeenCalledTimes(1);
+    expect(setGeneratedTitleIfUnset).toHaveBeenCalledWith(
+      "agent-1",
+      "x".repeat(MAX_AUTO_AGENT_TITLE_CHARS),
+    );
   });
 
   it("does not generate an auto title when an explicit title is provided", async () => {
-    const setTitle = vi.fn().mockResolvedValue(undefined);
-    const manager = { setTitle } as unknown as AgentManager;
+    const setGeneratedTitleIfUnset = vi.fn().mockResolvedValue(undefined);
+    const manager = { setGeneratedTitleIfUnset } as unknown as AgentManager;
     const generateStructured = vi.fn().mockResolvedValue({ title: "Generated" }) as NonNullable<
       AgentMetadataGeneratorDeps["generateStructuredAgentResponseWithFallback"]
     >;
@@ -86,15 +89,15 @@ describe("agent metadata generator auto-title", () => {
     });
 
     expect(generateStructured).not.toHaveBeenCalled();
-    expect(setTitle).not.toHaveBeenCalled();
+    expect(setGeneratedTitleIfUnset).not.toHaveBeenCalled();
   });
 
   it("notifies agent state after successfully renaming a generated branch", async () => {
-    const setTitle = vi.fn().mockResolvedValue(undefined);
+    const setGeneratedTitleIfUnset = vi.fn().mockResolvedValue(undefined);
     const notifyAgentState = vi.fn();
     const flush = vi.fn().mockResolvedValue(undefined);
     const manager = {
-      setTitle,
+      setGeneratedTitleIfUnset,
       notifyAgentState,
       flush,
     } as unknown as AgentManager;
@@ -129,12 +132,12 @@ describe("agent metadata generator auto-title", () => {
       "feature/metadata-worktree",
     );
     expect(notifyAgentState).toHaveBeenCalledWith("agent-branch");
-    expect(setTitle).not.toHaveBeenCalled();
+    expect(setGeneratedTitleIfUnset).not.toHaveBeenCalled();
   });
 
   it("forces a workspace git snapshot refresh after renaming a generated branch", async () => {
     const manager = {
-      setTitle: vi.fn().mockResolvedValue(undefined),
+      setGeneratedTitleIfUnset: vi.fn().mockResolvedValue(undefined),
       notifyAgentState: vi.fn(),
       flush: vi.fn().mockResolvedValue(undefined),
     } as unknown as AgentManager;
@@ -173,10 +176,10 @@ describe("agent metadata generator auto-title", () => {
   });
 
   it("uses the workspace git service snapshot for branch rename eligibility checks", async () => {
-    const setTitle = vi.fn().mockResolvedValue(undefined);
+    const setGeneratedTitleIfUnset = vi.fn().mockResolvedValue(undefined);
     const notifyAgentState = vi.fn();
     const manager = {
-      setTitle,
+      setGeneratedTitleIfUnset,
       notifyAgentState,
       flush: vi.fn().mockResolvedValue(undefined),
     } as unknown as AgentManager;
