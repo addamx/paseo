@@ -8,8 +8,6 @@ const readyEmptyWorkspace = {
   hasHydratedWorkspaceLayoutStore: true,
   hasHydratedAgents: true,
   hasLoadedTerminals: true,
-  activeAgentCount: 0,
-  terminalCount: 0,
   tabCount: 0,
 };
 
@@ -35,19 +33,7 @@ describe("shouldSeedEmptyWorkspaceDraft", () => {
     ).toBe(false);
   });
 
-  it("does not seed when existing workspace content is known", () => {
-    expect(
-      shouldSeedEmptyWorkspaceDraft({
-        ...readyEmptyWorkspace,
-        activeAgentCount: 1,
-      }),
-    ).toBe(false);
-    expect(
-      shouldSeedEmptyWorkspaceDraft({
-        ...readyEmptyWorkspace,
-        terminalCount: 1,
-      }),
-    ).toBe(false);
+  it("does not seed when a workspace tab already exists", () => {
     expect(
       shouldSeedEmptyWorkspaceDraft({
         ...readyEmptyWorkspace,

@@ -29,8 +29,16 @@ interface MockProviderOptions {
   defaultModeId?: string | null;
   modes?: AgentMode[];
   isAvailable?: () => Promise<boolean>;
-  fetchModels?: (cwd: string, force: boolean) => Promise<AgentModelDefinition[]>;
-  fetchModes?: (cwd: string, force: boolean) => Promise<AgentMode[]>;
+  fetchModels?: (
+    cwd: string,
+    force: boolean,
+    signal: AbortSignal | undefined,
+  ) => Promise<AgentModelDefinition[]>;
+  fetchModes?: (
+    cwd: string,
+    force: boolean,
+    signal: AbortSignal | undefined,
+  ) => Promise<AgentMode[]>;
 }
 
 interface MockProviderHandle {
@@ -640,10 +648,14 @@ describe("ProviderSnapshotManager", () => {
 
   test("refresh marks a slow provider as error after the timeout", async () => {
     const fetchModels = deferred<AgentModelDefinition[]>();
+    let capturedSignal: AbortSignal | undefined;
     const { registry } = createRegistry([
       createMockProvider({
         provider: "codex",
-        fetchModels: async () => fetchModels.promise,
+        fetchModels: async (_cwd, _force, signal) => {
+          capturedSignal = signal;
+          return fetchModels.promise;
+        },
         fetchModes: async () => [createMode("auto")],
       }),
     ]);
@@ -658,9 +670,39 @@ describe("ProviderSnapshotManager", () => {
       status: "error",
       error: "Timed out refreshing codex after 5ms",
     });
+    expect(capturedSignal?.aborted).toBe(true);
 
     manager.destroy();
     fetchModels.resolve([createModel("codex", "gpt-5.2")]);
+  });
+
+  test("refresh marks a slow Copilot provider as unavailable without warning", async () => {
+    const fetchModels = deferred<AgentModelDefinition[]>();
+    const logger = createInspectableLogger();
+    const { registry } = createRegistry([
+      createMockProvider({
+        provider: "copilot",
+        label: "Copilot",
+        fetchModels: async () => fetchModels.promise,
+        fetchModes: async () => [createMode("agent")],
+      }),
+    ]);
+    const manager = new ProviderSnapshotManager(registry, logger.logger, {
+      refreshTimeoutMs: 5,
+    });
+
+    await manager.refresh({ cwd: projectCwd, providers: ["copilot"] });
+
+    expect(getProviderEntry(manager.getSnapshot(projectCwd), "copilot")).toMatchObject({
+      provider: "copilot",
+      status: "unavailable",
+      error: "Timed out refreshing Copilot after 5ms",
+    });
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+
+    manager.destroy();
+    fetchModels.resolve([createModel("copilot", "gpt-5")]);
   });
 
   test("getSnapshot returns stale ready entries and starts background warm-up when snapshot is older than TTL", async () => {
@@ -1275,18 +1317,33 @@ function createRegistry(handles: MockProviderHandle[]): {
   };
 }
 
+function createInspectableLogger(): {
+  logger: ReturnType<typeof createTestLogger>;
+  warn: ReturnType<typeof vi.fn>;
+  debug: ReturnType<typeof vi.fn>;
+} {
+  const warn = vi.fn();
+  const debug = vi.fn();
+  const logger = {
+    ...createTestLogger(),
+    warn,
+    debug,
+  } as ReturnType<typeof createTestLogger>;
+  return { logger, warn, debug };
+}
+
 function createMockProvider(options: MockProviderOptions): MockProviderHandle {
   const createClient = vi.fn();
   const isAvailable = vi.fn(async () => options.isAvailable?.() ?? true);
   const fetchModels = vi.fn(
     async (listOptions: ListModelsOptions) =>
-      options.fetchModels?.(listOptions.cwd, listOptions.force) ?? [
+      options.fetchModels?.(listOptions.cwd, listOptions.force, listOptions.signal) ?? [
         createModel(options.provider, `${options.provider}-default`),
       ],
   );
   const fetchModes = vi.fn(
     async (listOptions: ListModesOptions) =>
-      options.fetchModes?.(listOptions.cwd, listOptions.force) ?? [
+      options.fetchModes?.(listOptions.cwd, listOptions.force, listOptions.signal) ?? [
         createMode(`${options.provider}-mode`),
       ],
   );

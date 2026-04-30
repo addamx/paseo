@@ -19,6 +19,7 @@ function getLogger(logger: LoggerLike): LoggerLike {
 
 type AgentStoragePersistence = Pick<AgentStorage, "applySnapshot" | "list">;
 type AgentManagerStateSource = Pick<AgentManager, "subscribe">;
+const CODEX_DEFAULT_MODE_ID = "auto";
 
 interface BuildSessionConfigOptions {
   validProviders?: Iterable<AgentProvider>;
@@ -62,9 +63,13 @@ export function attachAgentStoragePersistence(
 }
 
 export function buildConfigOverrides(record: StoredAgentRecord): Partial<AgentSessionConfig> {
+  const modeId =
+    record.lastModeId ??
+    record.config?.modeId ??
+    (record.provider === "codex" ? CODEX_DEFAULT_MODE_ID : undefined);
   return {
     cwd: record.cwd,
-    modeId: record.lastModeId ?? record.config?.modeId ?? undefined,
+    modeId,
     model: record.config?.model ?? undefined,
     thinkingOptionId: record.config?.thinkingOptionId ?? undefined,
     featureValues: record.config?.featureValues ?? undefined,

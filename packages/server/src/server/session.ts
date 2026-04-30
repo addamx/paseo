@@ -133,6 +133,7 @@ import type {
   AgentRunOptions,
   AgentSessionConfig,
   AgentStreamEvent,
+  PersistedAgentDescriptor,
   ProviderSnapshotEntry,
 } from "./agent/agent-sdk-types.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
@@ -620,6 +621,7 @@ const MIN_STREAMING_SEGMENT_BYTES = Math.round(
   PCM_BYTES_PER_MS * MIN_STREAMING_SEGMENT_DURATION_MS,
 );
 const AgentIdSchema = z.string().uuid();
+const DISCOVERED_CODEX_DEFAULT_MODE_ID = "auto";
 const VOICE_INTERRUPT_CONFIRMATION_MS = 500;
 const AVAILABLE_EDITOR_TARGETS_CACHE_TTL_MS = 60_000;
 const AVAILABLE_EDITOR_TARGETS_CACHE_KEY = "available";
@@ -1421,6 +1423,149 @@ export class Session {
     registeredProviderIds = this.getRegisteredProviderIds(),
   ): AgentSnapshotPayload {
     return buildStoredAgentPayload(record, registeredProviderIds);
+  }
+
+  private getPersistenceKey(
+    handle: { provider: string; sessionId: string } | null | undefined,
+  ): string | null {
+    return handle ? `${handle.provider}:${handle.sessionId}` : null;
+  }
+
+  private buildStoredRecordForDiscoveredCodexSession(
+    descriptor: PersistedAgentDescriptor,
+  ): StoredAgentRecord {
+    const timestamp = descriptor.lastActivityAt.toISOString();
+    return {
+      id: uuidv4(),
+      provider: "codex",
+      cwd: descriptor.cwd,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      lastUserMessageAt: null,
+      title: descriptor.title,
+      labels: {},
+      lastStatus: "closed",
+      lastModeId: DISCOVERED_CODEX_DEFAULT_MODE_ID,
+      config: {
+        title: descriptor.title,
+        modeId: DISCOVERED_CODEX_DEFAULT_MODE_ID,
+      },
+      runtimeInfo: {
+        provider: "codex",
+        sessionId: descriptor.sessionId,
+      },
+      persistence: descriptor.persistence,
+    };
+  }
+
+  private buildUpdatedRecordForDiscoveredCodexSession(
+    record: StoredAgentRecord,
+    descriptor: PersistedAgentDescriptor,
+  ): StoredAgentRecord {
+    const existingTimestamp = record.lastActivityAt ?? record.updatedAt;
+    const timestamp =
+      descriptor.lastActivityAt.getTime() > Date.parse(existingTimestamp)
+        ? descriptor.lastActivityAt.toISOString()
+        : existingTimestamp;
+    return {
+      ...record,
+      provider: "codex",
+      cwd: descriptor.cwd,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      title: descriptor.title,
+      lastModeId: record.lastModeId ?? DISCOVERED_CODEX_DEFAULT_MODE_ID,
+      config: {
+        ...record.config,
+        title: descriptor.title,
+        modeId: record.config?.modeId ?? DISCOVERED_CODEX_DEFAULT_MODE_ID,
+      },
+      runtimeInfo: {
+        ...record.runtimeInfo,
+        provider: "codex",
+        sessionId: descriptor.sessionId,
+      },
+      persistence: descriptor.persistence,
+    };
+  }
+
+  private async syncStoredCodexSessionFromDiscovery(
+    record: StoredAgentRecord,
+    descriptor: PersistedAgentDescriptor,
+  ): Promise<void> {
+    const nextRecord = this.buildUpdatedRecordForDiscoveredCodexSession(record, descriptor);
+    if (equal(record, nextRecord)) {
+      return;
+    }
+
+    const workspace =
+      record.cwd === descriptor.cwd
+        ? null
+        : await this.findOrCreateWorkspaceForDirectory(descriptor.cwd);
+    await this.agentStorage.upsert(nextRecord);
+    if (workspace) {
+      await this.emitWorkspaceUpdateForWorkspaceId(workspace.workspaceId);
+    }
+  }
+
+  private async importCodexPersistedAgentsForHistory(limit: number): Promise<void> {
+    try {
+      const descriptors = await this.agentManager.listPersistedAgents({
+        provider: "codex",
+        includeTimeline: false,
+        limit,
+      });
+      if (descriptors.length === 0) {
+        return;
+      }
+
+      const records = await this.agentStorage.list();
+      const recordsByPersistence = new Map<string, StoredAgentRecord>();
+      for (const record of records) {
+        const key = this.getPersistenceKey(record.persistence);
+        if (key) {
+          recordsByPersistence.set(key, record);
+        }
+      }
+
+      const livePersistenceKeys = new Set<string>();
+      for (const agent of this.agentManager.listAgents()) {
+        const key = this.getPersistenceKey(agent.persistence);
+        if (key) {
+          livePersistenceKeys.add(key);
+        }
+      }
+
+      for (const descriptor of descriptors) {
+        if (descriptor.provider !== "codex" || descriptor.persistence.provider !== "codex") {
+          continue;
+        }
+
+        const key = this.getPersistenceKey(descriptor.persistence);
+        if (!key) {
+          continue;
+        }
+
+        const existing = recordsByPersistence.get(key);
+        if (existing) {
+          await this.syncStoredCodexSessionFromDiscovery(existing, descriptor);
+          continue;
+        }
+
+        if (livePersistenceKeys.has(key)) {
+          continue;
+        }
+
+        const workspace = await this.findOrCreateWorkspaceForDirectory(descriptor.cwd);
+        const record = this.buildStoredRecordForDiscoveredCodexSession(descriptor);
+        await this.agentStorage.upsert(record);
+        recordsByPersistence.set(key, record);
+        await this.emitWorkspaceUpdateForWorkspaceId(workspace.workspaceId);
+      }
+    } catch (error) {
+      this.sessionLogger.warn({ err: error }, "Failed to discover Codex persisted sessions");
+    }
   }
 
   private isProviderVisibleToClient(provider: string): boolean {
@@ -6981,6 +7126,7 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "fetch_agent_history_request" }>,
   ): Promise<void> {
     try {
+      await this.importCodexPersistedAgentsForHistory(request.page?.limit ?? 200);
       const payload = await this.listFetchAgentsEntries(request);
       this.emit({
         type: "fetch_agent_history_response",

@@ -2,18 +2,26 @@ interface TimeoutOptions<T> {
   promise: Promise<T>;
   timeoutMs: number;
   label: string;
+  onTimeout?: () => void;
 }
 
 export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T>;
+export function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+  onTimeout: () => void,
+): Promise<T>;
 export function withTimeout<T>(options: TimeoutOptions<T>): Promise<T>;
 export function withTimeout<T>(
   promiseOrOptions: Promise<T> | TimeoutOptions<T>,
   timeoutMs?: number,
   message?: string,
+  onTimeout?: () => void,
 ): Promise<T> {
   const options =
     typeof timeoutMs === "number"
-      ? { promise: promiseOrOptions as Promise<T>, timeoutMs, message }
+      ? { promise: promiseOrOptions as Promise<T>, timeoutMs, message, onTimeout }
       : resolveTimeoutOptions(promiseOrOptions as TimeoutOptions<T>);
 
   if (typeof options.timeoutMs !== "number" || !options.message) {
@@ -22,7 +30,10 @@ export function withTimeout<T>(
 
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timeout = setTimeout(() => reject(new Error(options.message)), options.timeoutMs);
+    timeout = setTimeout(() => {
+      options.onTimeout?.();
+      reject(new Error(options.message));
+    }, options.timeoutMs);
   });
 
   return Promise.race([options.promise, timeoutPromise]).finally(() => {
@@ -36,10 +47,12 @@ function resolveTimeoutOptions<T>(options: TimeoutOptions<T>): {
   promise: Promise<T>;
   timeoutMs: number;
   message: string;
+  onTimeout?: () => void;
 } {
   return {
     promise: options.promise,
     timeoutMs: options.timeoutMs,
     message: `Timed out after ${options.timeoutMs}ms (${options.label})`,
+    onTimeout: options.onTimeout,
   };
 }

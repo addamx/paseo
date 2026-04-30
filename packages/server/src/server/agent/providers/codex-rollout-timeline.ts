@@ -10,6 +10,9 @@ import { mapCodexRolloutToolCall } from "./codex/tool-call-mapper.js";
 import { extractCodexTerminalSessionId, nonEmptyString } from "./tool-call-mapper-utils.js";
 
 const MAX_ROLLOUT_SEARCH_DEPTH = 4;
+const GENERATED_IMAGE_ID_PLACEHOLDER = "_image_id_";
+const GENERATED_IMAGE_NOTICE_FOLLOWUP =
+  "If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.";
 
 function resolveCodexSessionRoot(): string | null {
   if (process.env.CODEX_SESSION_DIR) {
@@ -87,7 +90,7 @@ function extractContentTextByType(content: unknown, itemType: string): string {
 
 const RolloutResponseMessagePayloadSchema = z.object({
   type: z.literal("message"),
-  role: z.enum(["user", "assistant"]).optional(),
+  role: z.enum(["user", "assistant", "developer"]).optional(),
   content: z.unknown().optional(),
 });
 
@@ -168,11 +171,20 @@ const RolloutEventUserMessagePayloadSchema = z.object({
     .optional(),
 });
 
+const RolloutEventImageGenerationEndPayloadSchema = z
+  .object({
+    type: z.literal("image_generation_end"),
+    call_id: z.string().optional(),
+  })
+  .passthrough();
+
 type RolloutResponseReasoningPayload = z.infer<typeof RolloutResponseReasoningPayloadSchema>;
 type ParsedRolloutRecord =
   | { kind: "timeline"; item: AgentTimelineItem }
   | { kind: "call"; name: string; callId?: string; input?: unknown }
   | { kind: "output"; callId: string; output: unknown }
+  | { kind: "generated_image_notice"; text: string; templatePath: string }
+  | { kind: "generated_image_end"; callId: string }
   | { kind: "ignore" };
 
 const RolloutMessageContentSchema = z.union([
@@ -221,6 +233,51 @@ function extractEventMessageText(message: unknown): string {
     return "";
   }
   return parsed.data;
+}
+
+function parseGeneratedImageNotice(text: string): { text: string; templatePath: string } | null {
+  const normalized = text.trim();
+  const [summary, followup, ...extra] = normalized.split(/\r?\n/);
+  if (!summary || followup !== GENERATED_IMAGE_NOTICE_FOLLOWUP || extra.length > 0) {
+    return null;
+  }
+
+  const match = /^Generated images are saved to (.+) as (.+_image_id_\.png) by default\.$/.exec(
+    summary,
+  );
+  const templatePath = match?.[2]?.trim();
+  if (!templatePath) {
+    return null;
+  }
+
+  return { text: normalized, templatePath };
+}
+
+function resolveGeneratedImagePath(templatePath: string, callId: string): string | null {
+  if (!templatePath.includes(GENERATED_IMAGE_ID_PLACEHOLDER)) {
+    return null;
+  }
+  return templatePath.replace(GENERATED_IMAGE_ID_PLACEHOLDER, callId);
+}
+
+function pathToFileUri(filePath: string): string {
+  const normalized = filePath.replace(/\\/g, "/");
+  if (normalized.startsWith("file://")) {
+    return normalized;
+  }
+  if (normalized.startsWith("/")) {
+    return `file://${encodeURI(normalized)}`;
+  }
+  return `file:///${encodeURI(normalized)}`;
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(filePath);
+    return stat.isFile();
+  } catch {
+    return false;
+  }
 }
 
 function isSyntheticRolloutUserMessage(text: string): boolean {
@@ -367,6 +424,10 @@ const FunctionCallInputNormalizationSchema = z.union([
 const RolloutResponseRecordSchema = z.union([
   RolloutResponseMessagePayloadSchema.transform((payload): ParsedRolloutRecord => {
     const text = extractMessageText(payload.content);
+    if (payload.role === "developer") {
+      const notice = parseGeneratedImageNotice(text);
+      return notice ? { kind: "generated_image_notice", ...notice } : { kind: "ignore" };
+    }
     const itemType = payload.role === "assistant" ? "assistant_message" : "user_message";
     const shouldEmit =
       text.length > 0 && (itemType !== "user_message" || !isSyntheticRolloutUserMessage(text));
@@ -413,6 +474,12 @@ const RolloutResponseRecordSchema = z.union([
 ]);
 
 const RolloutEventRecordSchema = z.union([
+  RolloutEventImageGenerationEndPayloadSchema.transform(
+    (payload): ParsedRolloutRecord =>
+      payload.call_id
+        ? { kind: "generated_image_end", callId: payload.call_id }
+        : { kind: "ignore" },
+  ),
   RolloutEventAgentReasoningPayloadSchema.transform(
     (payload): ParsedRolloutRecord =>
       payload.text
@@ -519,6 +586,116 @@ function dedupeMirroredTextTimelineItems(timeline: AgentTimelineItem[]): AgentTi
   return deduped;
 }
 
+interface PendingGeneratedImageNotice {
+  timelineIndex: number;
+  templatePath: string;
+  text: string;
+}
+
+async function applyGeneratedImageEndRecord(params: {
+  record: Extract<ParsedRolloutRecord, { kind: "generated_image_end" }>;
+  pendingNotices: PendingGeneratedImageNotice[];
+  timeline: AgentTimelineItem[];
+}): Promise<void> {
+  const notice = params.pendingNotices.shift();
+  const imagePath = notice
+    ? resolveGeneratedImagePath(notice.templatePath, params.record.callId)
+    : null;
+  if (notice && imagePath && (await fileExists(imagePath))) {
+    params.timeline[notice.timelineIndex] = {
+      type: "assistant_message",
+      text: `${notice.text}\n\n![Generated image](${pathToFileUri(imagePath)})`,
+    };
+  }
+}
+
+function appendRolloutCallTimelineItem(params: {
+  record: Extract<ParsedRolloutRecord, { kind: "call" }>;
+  outputsByCallId: ReadonlyMap<string, unknown>;
+  terminalCommandsBySessionId: ReadonlyMap<string, string>;
+  timeline: AgentTimelineItem[];
+}): void {
+  const { record, outputsByCallId, terminalCommandsBySessionId, timeline } = params;
+  if (record.name === "write_stdin") {
+    const input =
+      record.input && typeof record.input === "object"
+        ? (record.input as { session_id?: unknown; sessionId?: unknown })
+        : null;
+    const sessionId =
+      readTerminalSessionId(input?.session_id) ?? readTerminalSessionId(input?.sessionId);
+    timeline.push(
+      mapCodexTerminalInteractionToToolCall({
+        processId: sessionId,
+        fallbackCallId: record.callId,
+        command: sessionId ? terminalCommandsBySessionId.get(sessionId) : undefined,
+      }),
+    );
+    return;
+  }
+
+  const mapped = mapCodexRolloutToolCall({
+    callId: record.callId ?? null,
+    name: record.name,
+    input: record.input ?? null,
+    output: record.callId ? (outputsByCallId.get(record.callId) ?? null) : null,
+  });
+  if (mapped) {
+    timeline.push(mapped);
+  }
+}
+
+async function buildTimelineFromParsedRecords(
+  parsedRecords: ParsedRolloutRecord[],
+): Promise<AgentTimelineItem[]> {
+  const outputsByCallId = parsedRecords
+    .filter(
+      (record): record is Extract<ParsedRolloutRecord, { kind: "output" }> =>
+        record.kind === "output",
+    )
+    .reduce((map, record) => map.set(record.callId, record.output), new Map<string, unknown>());
+  const terminalCommandsBySessionId = buildTerminalCommandBySessionId(parsedRecords);
+
+  const timeline: AgentTimelineItem[] = [];
+  const pendingGeneratedImageNotices: PendingGeneratedImageNotice[] = [];
+
+  for (const record of parsedRecords) {
+    switch (record.kind) {
+      case "timeline":
+        timeline.push(record.item);
+        break;
+      case "generated_image_notice":
+        // Keep the notice at its original position, then patch in the image link when the
+        // following image_generation_end event reveals the generated file id.
+        pendingGeneratedImageNotices.push({
+          timelineIndex: timeline.length,
+          templatePath: record.templatePath,
+          text: record.text,
+        });
+        timeline.push({ type: "assistant_message", text: record.text });
+        break;
+      case "generated_image_end":
+        await applyGeneratedImageEndRecord({
+          record,
+          pendingNotices: pendingGeneratedImageNotices,
+          timeline,
+        });
+        break;
+      case "call":
+        appendRolloutCallTimelineItem({
+          record,
+          outputsByCallId,
+          terminalCommandsBySessionId,
+          timeline,
+        });
+        break;
+      default:
+        break;
+    }
+  }
+
+  return timeline;
+}
+
 export async function parseRolloutFile(filePath: string): Promise<AgentTimelineItem[]> {
   const content = await fs.readFile(filePath, "utf8");
   const trimmed = content.trim();
@@ -552,44 +729,7 @@ export async function parseRolloutFile(filePath: string): Promise<AgentTimelineI
     .filter((result): result is { success: true; data: ParsedRolloutRecord } => result.success)
     .map((result) => result.data);
 
-  const outputsByCallId = parsedRecords
-    .filter(
-      (record): record is Extract<ParsedRolloutRecord, { kind: "output" }> =>
-        record.kind === "output",
-    )
-    .reduce((map, record) => map.set(record.callId, record.output), new Map<string, unknown>());
-  const terminalCommandsBySessionId = buildTerminalCommandBySessionId(parsedRecords);
-
-  const timeline = parsedRecords.flatMap((record): AgentTimelineItem[] => {
-    if (record.kind === "timeline") {
-      return [record.item];
-    }
-    if (record.kind !== "call") {
-      return [];
-    }
-    if (record.name === "write_stdin") {
-      const input =
-        record.input && typeof record.input === "object"
-          ? (record.input as { session_id?: unknown; sessionId?: unknown })
-          : null;
-      const sessionId =
-        readTerminalSessionId(input?.session_id) ?? readTerminalSessionId(input?.sessionId);
-      return [
-        mapCodexTerminalInteractionToToolCall({
-          processId: sessionId,
-          fallbackCallId: record.callId,
-          command: sessionId ? terminalCommandsBySessionId.get(sessionId) : undefined,
-        }),
-      ];
-    }
-    const mapped = mapCodexRolloutToolCall({
-      callId: record.callId ?? null,
-      name: record.name,
-      input: record.input ?? null,
-      output: record.callId ? (outputsByCallId.get(record.callId) ?? null) : null,
-    });
-    return mapped ? [mapped] : [];
-  });
+  const timeline = await buildTimelineFromParsedRecords(parsedRecords);
   return dedupeMirroredTextTimelineItems(timeline);
 }
 

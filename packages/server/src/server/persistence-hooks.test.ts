@@ -99,6 +99,22 @@ describe("persistence hooks", () => {
     });
   });
 
+  test("buildConfigOverrides defaults legacy Codex records to auto mode", () => {
+    const record = createRecord({
+      provider: "codex",
+      lastModeId: null,
+      config: {
+        title: "Imported Codex",
+      },
+    });
+
+    expect(buildConfigOverrides(record)).toMatchObject({
+      cwd: "/tmp/project",
+      modeId: "auto",
+      title: "Imported Codex",
+    });
+  });
+
   test("buildSessionConfig accepts providers from the canonical manifest", () => {
     const record = createRecord({
       provider: "claude",

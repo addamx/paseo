@@ -5,6 +5,7 @@ import {
   Pressable,
   ActivityIndicator,
   type GestureResponderEvent,
+  type ImageLoadEvent,
   type LayoutChangeEvent,
   StyleProp,
   ViewStyle,
@@ -140,6 +141,7 @@ const MARKDOWN_ALLOWED_IMAGE_HANDLERS = [
   "data:image/png;base64",
   "data:image/gif;base64",
   "data:image/jpeg;base64",
+  "file://",
   "https://",
   "http://",
 ] as const;
@@ -541,6 +543,15 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
     paddingVertical: theme.spacing[6],
     gap: theme.spacing[2],
   },
+  imageLoadingOverlay: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   imageErrorText: {
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
@@ -549,6 +560,48 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
 }));
 
 const ASSISTANT_IMAGE_MIN_HEIGHT = 160;
+
+interface ImageLoadDimensions {
+  width: number;
+  height: number;
+}
+
+interface WebImageLoadTarget {
+  naturalWidth?: number;
+  naturalHeight?: number;
+  width?: number;
+  height?: number;
+}
+
+function getPositiveNumber(value: unknown): number | null {
+  return typeof value === "number" && value > 0 ? value : null;
+}
+
+function getWebImageLoadTargetDimensions(target: unknown): ImageLoadDimensions | null {
+  if (!target || typeof target !== "object") {
+    return null;
+  }
+
+  const record = target as WebImageLoadTarget;
+  const width = getPositiveNumber(record.naturalWidth) ?? getPositiveNumber(record.width);
+  const height = getPositiveNumber(record.naturalHeight) ?? getPositiveNumber(record.height);
+  return width && height ? { width, height } : null;
+}
+
+function getAssistantImageLoadDimensions(event: ImageLoadEvent): ImageLoadDimensions {
+  const nativeSource = event.nativeEvent.source;
+  if (nativeSource) {
+    return { width: nativeSource.width, height: nativeSource.height };
+  }
+
+  return (
+    getWebImageLoadTargetDimensions(event.currentTarget) ??
+    getWebImageLoadTargetDimensions(event.target) ?? {
+      width: ASSISTANT_IMAGE_MIN_HEIGHT,
+      height: ASSISTANT_IMAGE_MIN_HEIGHT,
+    }
+  );
+}
 
 const AssistantMarkdownResolvedImage = memo(function AssistantMarkdownResolvedImage({
   uri,
@@ -580,37 +633,22 @@ const AssistantMarkdownResolvedImage = memo(function AssistantMarkdownResolvedIm
     }
 
     setLoadState({ status: "loading" });
-    let cancelled = false;
+  }, [cachedMetadata, uri]);
 
-    Image.getSize(
-      uri,
-      (width, height) => {
-        if (cancelled) {
-          return;
-        }
-        if (width > 0 && height > 0) {
-          const metadata = setAssistantImageMetadata(
-            { source, workspaceRoot, serverId },
-            { width, height },
-          );
-          setLoadState({
-            status: "ready",
-            aspectRatio: metadata?.aspectRatio ?? width / height,
-          });
-        }
-      },
-      () => {
-        if (cancelled) {
-          return;
-        }
-        setLoadState({ status: "error" });
-      },
-    );
-
-    return () => {
-      cancelled = true;
-    };
-  }, [cachedMetadata, serverId, source, uri, workspaceRoot]);
+  const handleImageLoad = useCallback(
+    (event: ImageLoadEvent) => {
+      const { width, height } = getAssistantImageLoadDimensions(event);
+      const metadata = setAssistantImageMetadata(
+        { source, workspaceRoot, serverId },
+        { width, height },
+      );
+      setLoadState({
+        status: "ready",
+        aspectRatio: metadata?.aspectRatio ?? width / height,
+      });
+    },
+    [serverId, source, workspaceRoot],
+  );
 
   const handleImageError = useCallback(() => {
     setLoadState({ status: "error" });
@@ -634,14 +672,11 @@ const AssistantMarkdownResolvedImage = memo(function AssistantMarkdownResolvedIm
   );
   const imageSource = useMemo(() => ({ uri }), [uri]);
 
-  if (loadState.status !== "ready") {
+  if (loadState.status === "error") {
     return (
       <View style={frameStyle}>
         <View style={stateSurfaceStyle}>
-          {loadState.status === "loading" ? <ActivityIndicator size="small" /> : null}
-          {loadState.status === "error" ? (
-            <Text style={assistantMessageStylesheet.imageErrorText}>Image unavailable</Text>
-          ) : null}
+          <Text style={assistantMessageStylesheet.imageErrorText}>Image unavailable</Text>
         </View>
       </View>
     );
@@ -655,8 +690,14 @@ const AssistantMarkdownResolvedImage = memo(function AssistantMarkdownResolvedIm
           style={assistantMessageStylesheet.image}
           resizeMode="contain"
           accessibilityLabel={alt}
+          onLoad={handleImageLoad}
           onError={handleImageError}
         />
+        {loadState.status === "loading" ? (
+          <View style={assistantMessageStylesheet.imageLoadingOverlay}>
+            <ActivityIndicator size="small" />
+          </View>
+        ) : null}
       </View>
     </View>
   );

@@ -258,6 +258,29 @@ interface MessageAssemblyState {
 
 export type SessionStateResponse = NewSessionResponse | LoadSessionResponse | ResumeSessionResponse;
 
+function assertProbeNotAborted(signal: AbortSignal | undefined, provider: string): void {
+  if (signal?.aborted) {
+    throw new Error(`${provider} ACP probe was aborted`);
+  }
+}
+
+function bindProbeAbort(probe: SpawnedACPProcess, signal: AbortSignal | undefined): () => void {
+  if (!signal) {
+    return () => {};
+  }
+  const abortHandler = () => {
+    probe.child.kill("SIGTERM");
+  };
+  if (signal.aborted) {
+    abortHandler();
+    return () => {};
+  }
+  signal.addEventListener("abort", abortHandler, { once: true });
+  return () => {
+    signal.removeEventListener("abort", abortHandler);
+  };
+}
+
 interface TerminalExit {
   exitCode?: number | null;
   signal?: string | null;
@@ -471,8 +494,10 @@ export class ACPAgentClient implements AgentClient {
 
   async listModels(options: ListModelsOptions): Promise<AgentModelDefinition[]> {
     const { cwd } = options;
-    const probe = await this.spawnProcess(PROBE_ENV);
+    const probe = await this.spawnProcess(PROBE_ENV, options.signal);
+    const releaseAbort = bindProbeAbort(probe, options.signal);
     try {
+      assertProbeNotAborted(options.signal, this.provider);
       const response = await probe.connection.newSession({
         cwd,
         mcpServers: [],
@@ -485,14 +510,17 @@ export class ACPAgentClient implements AgentClient {
       );
       return this.modelTransformer ? this.modelTransformer(models) : models;
     } finally {
+      releaseAbort();
       await this.closeProbe(probe);
     }
   }
 
   async listModes(options: ListModesOptions): Promise<AgentMode[]> {
     const { cwd } = options;
-    const probe = await this.spawnProcess(PROBE_ENV);
+    const probe = await this.spawnProcess(PROBE_ENV, options.signal);
+    const releaseAbort = bindProbeAbort(probe, options.signal);
     try {
+      assertProbeNotAborted(options.signal, this.provider);
       const response = await probe.connection.newSession({
         cwd,
         mcpServers: [],
@@ -505,6 +533,7 @@ export class ACPAgentClient implements AgentClient {
       );
       return modeInfo.modes;
     } finally {
+      releaseAbort();
       await this.closeProbe(probe);
     }
   }
@@ -564,7 +593,11 @@ export class ACPAgentClient implements AgentClient {
     }
   }
 
-  protected async spawnProcess(launchEnv?: Record<string, string>): Promise<SpawnedACPProcess> {
+  protected async spawnProcess(
+    launchEnv?: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<SpawnedACPProcess> {
+    assertProbeNotAborted(signal, this.provider);
     const { command, args } = await this.resolveLaunchCommand();
     const child = spawnProcess(command, args, {
       cwd: process.cwd(),
@@ -587,6 +620,18 @@ export class ACPAgentClient implements AgentClient {
       });
     });
 
+    let abortHandler: (() => void) | null = null;
+    const abortPromise = new Promise<never>((_, reject) => {
+      if (!signal) {
+        return;
+      }
+      abortHandler = () => {
+        child.kill("SIGTERM");
+        reject(new Error(`${this.provider} ACP probe was aborted`));
+      };
+      signal.addEventListener("abort", abortHandler, { once: true });
+    });
+
     if (!child.stdin || !child.stdout) {
       throw new Error(`${this.provider} ACP process did not expose stdio pipes`);
     }
@@ -604,7 +649,12 @@ export class ACPAgentClient implements AgentClient {
         clientInfo: { name: "Paseo", version: "dev" },
       }),
       spawnErrorPromise,
-    ])) as InitializeResponse;
+      abortPromise,
+    ]).finally(() => {
+      if (abortHandler) {
+        signal?.removeEventListener("abort", abortHandler);
+      }
+    })) as InitializeResponse;
 
     return { child, connection, initialize };
   }

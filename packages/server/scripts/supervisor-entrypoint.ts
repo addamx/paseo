@@ -57,7 +57,7 @@ function resolveDevWorkerEntry(): string {
 }
 
 function resolveWorkerExecArgv(workerEntry: string): string[] {
-  return workerEntry.endsWith(".ts") ? ["--import", "tsx"] : [];
+  return workerEntry.endsWith(".ts") ? ["--conditions=source", "--import", "tsx"] : [];
 }
 
 function resolvePackagedNodeEntrypointRunnerPath(currentScriptPath: string): string | null {

@@ -1753,8 +1753,6 @@ function WorkspaceScreenContent({
         hasHydratedWorkspaceLayoutStore,
         hasHydratedAgents,
         hasLoadedTerminals: terminalsQuery.isSuccess,
-        activeAgentCount: workspaceAgentVisibility.activeAgentIds.size,
-        terminalCount: terminals.length,
         tabCount: tabs.length,
       })
     ) {
@@ -1775,11 +1773,9 @@ function WorkspaceScreenContent({
     hasHydratedAgents,
     hasHydratedWorkspaceLayoutStore,
     isRouteFocused,
-    terminals.length,
     terminalsQuery.isSuccess,
     tabs.length,
     workspaceDirectory,
-    workspaceAgentVisibility.activeAgentIds.size,
   ]);
 
   useEffect(() => {

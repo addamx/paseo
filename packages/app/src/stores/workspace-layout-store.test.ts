@@ -1086,6 +1086,41 @@ describe("workspace-layout-store actions", () => {
     expect(findPaneById(layout.root, "main")?.focusedTabId).toBe("agent_agent-1");
   });
 
+  it("reconcileTabs leaves a first-open workspace ready for a draft tab", () => {
+    const workspaceKey = createWorkspaceKey();
+
+    useWorkspaceLayoutStore.getState().reconcileTabs(workspaceKey, {
+      agentsHydrated: true,
+      terminalsHydrated: true,
+      activeAgentIds: ["agent-1", "agent-2"],
+      knownAgentIds: ["agent-1", "agent-2"],
+      standaloneTerminalIds: ["term-1"],
+      hasActivePendingDraftCreate: false,
+    });
+
+    expect(useWorkspaceLayoutStore.getState().layoutByWorkspace[workspaceKey]).toBeUndefined();
+    expect(useWorkspaceLayoutStore.getState().getWorkspaceTabs(workspaceKey)).toEqual([]);
+  });
+
+  it("reconcileTabs does not auto-open entities into a draft-only workspace", () => {
+    const workspaceKey = createWorkspaceKey();
+    const store = useWorkspaceLayoutStore.getState();
+
+    store.openTabFocused(workspaceKey, { kind: "draft", draftId: "draft-first-open" });
+    store.reconcileTabs(workspaceKey, {
+      agentsHydrated: true,
+      terminalsHydrated: true,
+      activeAgentIds: ["agent-1"],
+      knownAgentIds: ["agent-1"],
+      standaloneTerminalIds: ["term-1"],
+      hasActivePendingDraftCreate: false,
+    });
+
+    expect(store.getWorkspaceTabs(workspaceKey).map((tab) => tab.tabId)).toEqual([
+      "draft-first-open",
+    ]);
+  });
+
   it("reconcileTabs does not re-add locally hidden agent tabs", () => {
     const workspaceKey = createWorkspaceKey();
 

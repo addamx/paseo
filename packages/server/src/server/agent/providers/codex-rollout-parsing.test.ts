@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
-import { rmSync, mkdtempSync, writeFileSync } from "node:fs";
+import { rmSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseRolloutFile } from "./codex-rollout-timeline.js";
@@ -459,6 +459,103 @@ describe("real rollout file structure", () => {
       { type: "reasoning", text: "thinking" },
       { type: "assistant_message", text: "answer" },
     ]);
+  });
+});
+
+describe("generated image parsing", () => {
+  const generatedImageNoticeText = (imageDir: string, templatePath: string) =>
+    [
+      `Generated images are saved to ${imageDir} as ${templatePath} by default.`,
+      "If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.",
+    ].join("\n");
+  const fileUriForPath = (filePath: string) => {
+    const normalized = filePath.replace(/\\/g, "/");
+    return normalized.startsWith("/") ? `file://${normalized}` : `file:///${normalized}`;
+  };
+
+  test("emits whitelisted developer generated image notices with file markdown", async () => {
+    const rolloutPath = join(tmpDir, "rollout.jsonl");
+    const imageDir = join(tmpDir, "generated_images", "thread-1");
+    const callId = "ig_abc123";
+    const templatePath = join(imageDir, "_image_id_.png");
+    mkdirSync(imageDir, { recursive: true });
+    writeFileSync(join(imageDir, `${callId}.png`), "png");
+
+    const noticeText = generatedImageNoticeText(imageDir, templatePath);
+    const imagePath = join(imageDir, `${callId}.png`);
+    const lines = [
+      JSON.stringify({
+        timestamp: "2026-04-30T08:20:19.690Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "developer",
+          content: [{ type: "input_text", text: noticeText }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-30T08:20:19.727Z",
+        type: "event_msg",
+        payload: {
+          type: "image_generation_end",
+          call_id: callId,
+          status: "generating",
+          result: "large-base64-payload",
+        },
+      }),
+    ];
+    writeFileSync(rolloutPath, lines.join("\n") + "\n");
+
+    const timeline = await parseRolloutFile(rolloutPath);
+
+    expect(timeline).toEqual([
+      {
+        type: "assistant_message",
+        text: `${noticeText}\n\n![Generated image](${fileUriForPath(imagePath)})`,
+      },
+    ]);
+  });
+
+  test("ignores ordinary developer messages and keeps missing image notices text-only", async () => {
+    const rolloutPath = join(tmpDir, "rollout.jsonl");
+    const imageDir = join(tmpDir, "generated_images", "thread-2");
+    const callId = "ig_missing";
+    const templatePath = join(imageDir, "_image_id_.png");
+    const noticeText = generatedImageNoticeText(imageDir, templatePath);
+
+    const lines = [
+      JSON.stringify({
+        timestamp: "2026-04-30T08:20:10.000Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "developer",
+          content: [{ type: "input_text", text: "Internal developer instructions" }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-30T08:20:19.690Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "developer",
+          content: [{ type: "input_text", text: noticeText }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-30T08:20:19.727Z",
+        type: "event_msg",
+        payload: {
+          type: "image_generation_end",
+          call_id: callId,
+        },
+      }),
+    ];
+    writeFileSync(rolloutPath, lines.join("\n") + "\n");
+
+    const timeline = await parseRolloutFile(rolloutPath);
+
+    expect(timeline).toEqual([{ type: "assistant_message", text: noticeText }]);
   });
 });
 

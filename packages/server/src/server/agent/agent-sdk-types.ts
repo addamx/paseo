@@ -414,6 +414,7 @@ export interface AgentSlashCommand {
 
 export interface ListPersistedAgentsOptions {
   limit?: number;
+  includeTimeline?: boolean;
 }
 
 export interface PersistedAgentDescriptor {
@@ -497,11 +498,13 @@ export interface AgentSession {
 export interface ListModelsOptions {
   cwd: string;
   force: boolean;
+  signal?: AbortSignal;
 }
 
 export interface ListModesOptions {
   cwd: string;
   force: boolean;
+  signal?: AbortSignal;
 }
 
 export interface AgentClient {

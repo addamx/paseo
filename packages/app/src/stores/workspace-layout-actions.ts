@@ -1578,6 +1578,7 @@ export function reconcileWorkspaceTabs(
   });
 
   const initialTabs = collectAllTabs(nextLayout.root);
+  const shouldAutoOpenMissingEntityTabs = initialTabs.some((tab) => isEntityTarget(tab.target));
   const representedAgentIds = new Set(
     initialTabs.filter(isAgentTab).map((tab) => tab.target.agentId),
   );
@@ -1621,13 +1622,17 @@ export function reconcileWorkspaceTabs(
     knownTerminalIds,
   });
 
-  nextLayout = addMissingEntityTabs({
-    layout: nextLayout,
-    visibleAgentIds,
-    representedAgentIds,
-    standaloneTerminalIds,
-    hasActivePendingDraftCreate: snapshot.hasActivePendingDraftCreate ?? false,
-  });
+  // A workspace with no entity tabs is a first-open/draft-only surface; do not
+  // expand it into every related running session unless the user has opened one.
+  if (shouldAutoOpenMissingEntityTabs) {
+    nextLayout = addMissingEntityTabs({
+      layout: nextLayout,
+      visibleAgentIds,
+      representedAgentIds,
+      standaloneTerminalIds,
+      hasActivePendingDraftCreate: snapshot.hasActivePendingDraftCreate ?? false,
+    });
+  }
 
   if (reconciledFocusedTabId) {
     nextLayout =

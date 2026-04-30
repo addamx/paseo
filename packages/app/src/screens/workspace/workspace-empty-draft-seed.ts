@@ -5,8 +5,6 @@ export function shouldSeedEmptyWorkspaceDraft(input: {
   hasHydratedWorkspaceLayoutStore: boolean;
   hasHydratedAgents: boolean;
   hasLoadedTerminals: boolean;
-  activeAgentCount: number;
-  terminalCount: number;
   tabCount: number;
 }): boolean {
   if (
@@ -20,5 +18,5 @@ export function shouldSeedEmptyWorkspaceDraft(input: {
     return false;
   }
 
-  return input.activeAgentCount === 0 && input.terminalCount === 0 && input.tabCount === 0;
+  return input.tabCount === 0;
 }

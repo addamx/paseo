@@ -10,6 +10,9 @@ import type { ProviderDefinition } from "./provider-registry.js";
 
 const DEFAULT_SNAPSHOT_TTL_MS = 300_000;
 const DEFAULT_REFRESH_TIMEOUT_MS = 30_000;
+// Copilot ACP probes can block on external auth/extension state. Treat that as
+// unavailable so an optional provider does not spam daemon warning logs.
+const SOFT_REFRESH_TIMEOUT_PROVIDERS = new Set<AgentProvider>(["copilot"]);
 
 type ProviderSnapshotChangeListener = (entries: ProviderSnapshotEntry[], cwd: string) => void;
 interface ProviderSnapshotManagerOptions {
@@ -275,13 +278,16 @@ export class ProviderSnapshotManager {
         return;
       }
 
+      const refreshAbortController = new AbortController();
+      const timeoutMessage = `Timed out refreshing ${definition.label} after ${this.refreshTimeoutMs}ms`;
       const [models, modes] = await withTimeout(
         Promise.all([
-          definition.fetchModels({ cwd, force }),
-          definition.fetchModes({ cwd, force }),
+          definition.fetchModels({ cwd, force, signal: refreshAbortController.signal }),
+          definition.fetchModes({ cwd, force, signal: refreshAbortController.signal }),
         ]),
         this.refreshTimeoutMs,
-        `Timed out refreshing ${definition.label} after ${this.refreshTimeoutMs}ms`,
+        timeoutMessage,
+        () => refreshAbortController.abort(),
       );
 
       setEntry({
@@ -293,13 +299,23 @@ export class ProviderSnapshotManager {
         fetchedAt: new Date().toISOString(),
       });
     } catch (error) {
+      const timeoutMessage = `Timed out refreshing ${definition.label} after ${this.refreshTimeoutMs}ms`;
+      const isSoftRefreshTimeout =
+        SOFT_REFRESH_TIMEOUT_PROVIDERS.has(provider) &&
+        error instanceof Error &&
+        error.message === timeoutMessage;
       const emitted = setEntry({
         ...base,
-        status: "error",
+        status: isSoftRefreshTimeout ? "unavailable" : "error",
         enabled: true,
         error: toErrorMessage(error),
       });
-      if (emitted) {
+      if (emitted && isSoftRefreshTimeout) {
+        this.logger.debug(
+          { err: error, provider, cwd },
+          "Provider snapshot refresh timed out; marking provider unavailable",
+        );
+      } else if (emitted) {
         this.logger.warn({ err: error, provider, cwd }, "Failed to refresh provider snapshot");
       }
     }

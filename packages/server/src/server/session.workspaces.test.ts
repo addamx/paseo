@@ -10,6 +10,8 @@ import type {
   EditorTargetDescriptorPayload,
   SessionOutboundMessage,
 } from "../shared/messages.js";
+import type { PersistedAgentDescriptor } from "./agent/agent-sdk-types.js";
+import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { WorkspaceGitRuntimeSnapshot } from "./workspace-git-service.js";
 import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
 import {
@@ -18,6 +20,10 @@ import {
 } from "./workspace-registry.js";
 
 interface SessionTestAccess {
+  agentManager: {
+    listAgents(): unknown[];
+    listPersistedAgents(...args: unknown[]): Promise<unknown[]>;
+  };
   projectRegistry: {
     list(...args: unknown[]): Promise<unknown[]>;
     archive(projectId: string, archivedAt: string): Promise<void>;
@@ -27,6 +33,7 @@ interface SessionTestAccess {
   agentStorage: {
     list(...args: unknown[]): Promise<unknown[]>;
     get(agentId: string): Promise<unknown>;
+    upsert(record: unknown): Promise<void>;
   };
   workspaceRegistry: {
     list(...args: unknown[]): Promise<unknown[]>;
@@ -184,6 +191,140 @@ function makeManagedAgent(input: {
   };
 }
 
+function makeCodexPersistedDescriptor(input: {
+  sessionId: string;
+  cwd: string;
+  title: string | null;
+  updatedAt: string;
+  provider?: PersistedAgentDescriptor["provider"];
+}): PersistedAgentDescriptor {
+  const provider = input.provider ?? "codex";
+  return {
+    provider,
+    sessionId: input.sessionId,
+    cwd: input.cwd,
+    title: input.title,
+    lastActivityAt: new Date(input.updatedAt),
+    persistence: {
+      provider,
+      sessionId: input.sessionId,
+      nativeHandle: input.sessionId,
+      metadata: {
+        provider,
+        cwd: input.cwd,
+        title: input.title,
+        threadId: input.sessionId,
+      },
+    },
+    timeline: [],
+  };
+}
+
+function makeStoredCodexRecord(input: {
+  id: string;
+  sessionId: string;
+  cwd: string;
+  title: string | null;
+  updatedAt: string;
+  labels?: Record<string, string>;
+  archivedAt?: string | null;
+}): StoredAgentRecord {
+  const record: StoredAgentRecord = {
+    id: input.id,
+    provider: "codex",
+    cwd: input.cwd,
+    createdAt: input.updatedAt,
+    updatedAt: input.updatedAt,
+    lastActivityAt: input.updatedAt,
+    lastUserMessageAt: null,
+    title: input.title,
+    labels: input.labels ?? {},
+    lastStatus: "closed",
+    lastModeId: null,
+    config: {
+      title: input.title,
+    },
+    runtimeInfo: {
+      provider: "codex",
+      sessionId: input.sessionId,
+    },
+    persistence: {
+      provider: "codex",
+      sessionId: input.sessionId,
+      nativeHandle: input.sessionId,
+    },
+  };
+  if (input.archivedAt !== undefined) {
+    record.archivedAt = input.archivedAt;
+  }
+  return record;
+}
+
+function attachMutableAgentStorage(session: TestSession, records: StoredAgentRecord[]) {
+  session.agentStorage.list = async () => records;
+  session.agentStorage.get = async (agentId: string) =>
+    records.find((record) => record.id === agentId) ?? null;
+  session.agentStorage.upsert = async (record: unknown) => {
+    const nextRecord = record as StoredAgentRecord;
+    const existingIndex = records.findIndex((entry) => entry.id === nextRecord.id);
+    if (existingIndex >= 0) {
+      records[existingIndex] = nextRecord;
+      return;
+    }
+    records.push(nextRecord);
+  };
+}
+
+function attachMutableWorkspaceRegistries(session: TestSession) {
+  const projects = new Map<string, ReturnType<typeof createPersistedProjectRecord>>();
+  const workspaces = new Map<string, ReturnType<typeof createPersistedWorkspaceRecord>>();
+
+  session.projectRegistry.list = async () => Array.from(projects.values());
+  session.projectRegistry.get = async (projectId: string) => projects.get(projectId) ?? null;
+  session.projectRegistry.upsert = async (record: unknown) => {
+    const project = record as ReturnType<typeof createPersistedProjectRecord>;
+    projects.set(project.projectId, project);
+  };
+
+  session.workspaceRegistry.list = async () => Array.from(workspaces.values());
+  session.workspaceRegistry.get = async (workspaceId: string) =>
+    workspaces.get(workspaceId) ?? null;
+  session.workspaceRegistry.upsert = async (record: unknown) => {
+    const workspace = record as ReturnType<typeof createPersistedWorkspaceRecord>;
+    workspaces.set(workspace.workspaceId, workspace);
+  };
+
+  return { projects, workspaces };
+}
+
+function seedDirectoryWorkspace(
+  registries: ReturnType<typeof attachMutableWorkspaceRegistries>,
+  cwd: string,
+) {
+  const timestamp = "2026-03-01T12:00:00.000Z";
+  const displayName = path.basename(cwd) || cwd;
+  const project = createPersistedProjectRecord({
+    projectId: cwd,
+    rootPath: cwd,
+    kind: "non_git",
+    displayName,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  registries.projects.set(project.projectId, project);
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: cwd,
+    projectId: project.projectId,
+    cwd,
+    kind: "directory",
+    displayName,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  registries.workspaces.set(workspace.workspaceId, workspace);
+  return workspace;
+}
+
 function agentIdsFromEntries(entries: Array<Record<string, unknown>>) {
   return entries.map((entry) => (entry.agent as Pick<AgentSnapshotPayload, "id">).id);
 }
@@ -275,6 +416,7 @@ function createSessionForWorkspaceTests(
       agentManager: {
         subscribe: () => () => {},
         listAgents: () => [],
+        listPersistedAgents: async () => [],
         getAgent: () => null,
         archiveAgent: async () => ({ archivedAt: new Date().toISOString() }),
         archiveSnapshot: async () => ({}),
@@ -284,6 +426,7 @@ function createSessionForWorkspaceTests(
       agentStorage: {
         list: async () => [],
         get: async () => null,
+        upsert: async () => {},
       } as unknown as SessionOptions["agentStorage"],
       projectRegistry: {
         initialize: async () => {},
@@ -1608,6 +1751,231 @@ test("fetch_agent_request still resolves archived historical agents", async () =
       },
     },
   ]);
+});
+
+test("fetch_agent_history_request imports discovered Codex sessions", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const records: StoredAgentRecord[] = [];
+  const session = createSessionForWorkspaceTests();
+  attachMutableAgentStorage(session, records);
+  attachMutableWorkspaceRegistries(session);
+  session.emit = (message) => emitted.push(message as SessionOutboundMessage);
+
+  let discoveryOptions: unknown;
+  session.agentManager.listPersistedAgents = async (options: unknown) => {
+    discoveryOptions = options;
+    return [
+      makeCodexPersistedDescriptor({
+        sessionId: "codex-thread-1",
+        cwd: "/tmp/codex-terminal",
+        title: "Terminal Codex",
+        updatedAt: "2026-04-30T08:00:00.000Z",
+      }),
+    ];
+  };
+
+  await session.handleMessage({
+    type: "fetch_agent_history_request",
+    requestId: "req-codex-import",
+    page: { limit: 25 },
+  });
+
+  expect(discoveryOptions).toEqual({
+    provider: "codex",
+    includeTimeline: false,
+    limit: 25,
+  });
+  expect(records).toHaveLength(1);
+  expect(records[0]).toMatchObject({
+    provider: "codex",
+    cwd: "/tmp/codex-terminal",
+    title: "Terminal Codex",
+    lastStatus: "closed",
+    lastModeId: "auto",
+    config: {
+      title: "Terminal Codex",
+      modeId: "auto",
+    },
+    runtimeInfo: {
+      provider: "codex",
+      sessionId: "codex-thread-1",
+    },
+    persistence: {
+      provider: "codex",
+      sessionId: "codex-thread-1",
+      nativeHandle: "codex-thread-1",
+    },
+  });
+  expect(records[0]?.id).not.toBe("codex-thread-1");
+  expect(emitted).toContainEqual({
+    type: "fetch_agent_history_response",
+    payload: expect.objectContaining({
+      requestId: "req-codex-import",
+      entries: [
+        expect.objectContaining({
+          agent: expect.objectContaining({
+            id: records[0]?.id,
+            provider: "codex",
+            title: "Terminal Codex",
+            persistence: expect.objectContaining({
+              provider: "codex",
+              sessionId: "codex-thread-1",
+            }),
+          }),
+        }),
+      ],
+    }),
+  });
+});
+
+test("fetch_agent_history_request updates an already imported Codex session without duplicating it", async () => {
+  const existing = makeStoredCodexRecord({
+    id: "agent-existing-codex",
+    sessionId: "codex-thread-2",
+    cwd: "/tmp/codex-old",
+    title: "Old title",
+    updatedAt: "2026-04-29T08:00:00.000Z",
+    labels: { source: "paseo" },
+    archivedAt: "2026-04-29T09:00:00.000Z",
+  });
+  const records: StoredAgentRecord[] = [existing];
+  const session = createSessionForWorkspaceTests();
+  attachMutableAgentStorage(session, records);
+  attachMutableWorkspaceRegistries(session);
+
+  session.agentManager.listPersistedAgents = async () => [
+    makeCodexPersistedDescriptor({
+      sessionId: "codex-thread-2",
+      cwd: "/tmp/codex-new",
+      title: "New title",
+      updatedAt: "2026-04-30T08:00:00.000Z",
+    }),
+  ];
+
+  await session.handleMessage({
+    type: "fetch_agent_history_request",
+    requestId: "req-codex-update",
+    page: { limit: 25 },
+  });
+
+  expect(records).toHaveLength(1);
+  expect(records[0]).toMatchObject({
+    id: "agent-existing-codex",
+    cwd: "/tmp/codex-new",
+    title: "New title",
+    lastModeId: "auto",
+    updatedAt: "2026-04-30T08:00:00.000Z",
+    lastActivityAt: "2026-04-30T08:00:00.000Z",
+    config: {
+      title: "New title",
+      modeId: "auto",
+    },
+    labels: { source: "paseo" },
+    archivedAt: "2026-04-29T09:00:00.000Z",
+    persistence: {
+      provider: "codex",
+      sessionId: "codex-thread-2",
+      nativeHandle: "codex-thread-2",
+    },
+  });
+});
+
+test("fetch_agent_history_request does not import a Codex session that is already live", async () => {
+  const records: StoredAgentRecord[] = [];
+  const session = createSessionForWorkspaceTests();
+  attachMutableAgentStorage(session, records);
+  attachMutableWorkspaceRegistries(session);
+  session.listAgentPayloads = async () => [];
+  session.agentManager.listAgents = () => [
+    {
+      persistence: {
+        provider: "codex",
+        sessionId: "codex-live-thread",
+      },
+    },
+  ];
+  session.agentManager.listPersistedAgents = async () => [
+    makeCodexPersistedDescriptor({
+      sessionId: "codex-live-thread",
+      cwd: "/tmp/codex-live",
+      title: "Live Codex",
+      updatedAt: "2026-04-30T08:00:00.000Z",
+    }),
+  ];
+
+  await session.handleMessage({
+    type: "fetch_agent_history_request",
+    requestId: "req-codex-live",
+    page: { limit: 25 },
+  });
+
+  expect(records).toEqual([]);
+});
+
+test("fetch_agent_history_request ignores non-Codex discovered sessions", async () => {
+  const records: StoredAgentRecord[] = [];
+  const session = createSessionForWorkspaceTests();
+  attachMutableAgentStorage(session, records);
+  attachMutableWorkspaceRegistries(session);
+  session.agentManager.listPersistedAgents = async () => [
+    makeCodexPersistedDescriptor({
+      provider: "claude",
+      sessionId: "claude-thread-1",
+      cwd: "/tmp/claude-terminal",
+      title: "Claude terminal",
+      updatedAt: "2026-04-30T08:00:00.000Z",
+    }),
+  ];
+
+  await session.handleMessage({
+    type: "fetch_agent_history_request",
+    requestId: "req-non-codex",
+    page: { limit: 25 },
+  });
+
+  expect(records).toEqual([]);
+});
+
+test("fetch_agent_history_request still returns existing history when Codex discovery fails", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const existing = makeStoredCodexRecord({
+    id: "agent-existing-history",
+    sessionId: "codex-existing-history",
+    cwd: "/tmp/codex-existing",
+    title: "Existing history",
+    updatedAt: "2026-04-29T08:00:00.000Z",
+  });
+  const records: StoredAgentRecord[] = [existing];
+  const session = createSessionForWorkspaceTests();
+  attachMutableAgentStorage(session, records);
+  const registries = attachMutableWorkspaceRegistries(session);
+  seedDirectoryWorkspace(registries, "/tmp/codex-existing");
+  session.emit = (message) => emitted.push(message as SessionOutboundMessage);
+  session.agentManager.listPersistedAgents = async () => {
+    throw new Error("codex unavailable");
+  };
+
+  await session.handleMessage({
+    type: "fetch_agent_history_request",
+    requestId: "req-codex-failure",
+    page: { limit: 25 },
+  });
+
+  expect(emitted).toContainEqual({
+    type: "fetch_agent_history_response",
+    payload: expect.objectContaining({
+      requestId: "req-codex-failure",
+      entries: [
+        expect.objectContaining({
+          agent: expect.objectContaining({
+            id: "agent-existing-history",
+            title: "Existing history",
+          }),
+        }),
+      ],
+    }),
+  });
+  expect(emitted.some((message) => message.type === "rpc_error")).toBe(false);
 });
 
 test("git branch workspace uses branch as canonical name", async () => {

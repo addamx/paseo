@@ -154,6 +154,23 @@ function normalizeCodexModelLabel(displayName: string): string {
   return displayName.replace(/\bgpt\b/gi, "GPT");
 }
 
+function codexThreadReadToTimeline(
+  read: { thread?: { turns?: Array<{ items?: unknown[] }> } },
+  cwd: string,
+): AgentTimelineItem[] {
+  const timeline: AgentTimelineItem[] = [];
+  const turns = read.thread?.turns ?? [];
+  for (const turn of turns) {
+    for (const item of turn.items ?? []) {
+      const timelineItem = threadItemToTimeline(item, { cwd });
+      if (timelineItem) {
+        timeline.push(timelineItem);
+      }
+    }
+  }
+  return timeline;
+}
+
 function isSchemaRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -2492,6 +2509,7 @@ class CodexAppServerAgentSession implements AgentSession {
   private planModeEnabled = false;
   private historyPending = false;
   private persistedHistory: AgentTimelineItem[] = [];
+  private emittedGeneratedImageTimelineTexts = new Set<string>();
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
   private pendingPermissionHandlers = new Map<
     string,
@@ -2822,11 +2840,55 @@ class CodexAppServerAgentSession implements AgentSession {
       const timeline = rolloutTimeline.length > 0 ? rolloutTimeline : threadTimeline;
 
       if (timeline.length > 0) {
+        this.rememberGeneratedImageTimelineItems(timeline);
         this.persistedHistory = timeline;
         this.historyPending = true;
       }
     } catch (error) {
       this.logger.warn({ error }, "Failed to load Codex thread history");
+    }
+  }
+
+  private getGeneratedImageTimelineText(item: AgentTimelineItem): string | null {
+    if (item.type !== "assistant_message") {
+      return null;
+    }
+    if (
+      !item.text.includes("Generated images are saved to ") ||
+      !item.text.includes("![Generated image](")
+    ) {
+      return null;
+    }
+    return item.text;
+  }
+
+  private rememberGeneratedImageTimelineItems(items: readonly AgentTimelineItem[]): void {
+    for (const item of items) {
+      const text = this.getGeneratedImageTimelineText(item);
+      if (text) {
+        this.emittedGeneratedImageTimelineTexts.add(text);
+      }
+    }
+  }
+
+  private async emitNewGeneratedImageTimelineItems(): Promise<void> {
+    if (!this.currentThreadId) return;
+    try {
+      const timeline = await loadCodexPersistedTimeline(
+        this.currentThreadId,
+        undefined,
+        this.logger,
+      );
+      for (const item of timeline) {
+        const text = this.getGeneratedImageTimelineText(item);
+        if (!text || this.emittedGeneratedImageTimelineTexts.has(text)) {
+          continue;
+        }
+        this.emittedGeneratedImageTimelineTexts.add(text);
+        this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item });
+      }
+    } catch (error) {
+      this.logger.warn({ error }, "Failed to emit Codex generated image timeline items");
     }
   }
 
@@ -3544,7 +3606,7 @@ class CodexAppServerAgentSession implements AgentSession {
         this.handleTurnStartedNotification(parsed);
         return;
       case "turn_completed":
-        this.handleTurnCompletedNotification(parsed);
+        void this.handleTurnCompletedNotification(parsed);
         return;
       case "plan_updated":
         this.handlePlanUpdatedNotification(parsed);
@@ -3643,9 +3705,9 @@ class CodexAppServerAgentSession implements AgentSession {
     this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER });
   }
 
-  private handleTurnCompletedNotification(
+  private async handleTurnCompletedNotification(
     parsed: Extract<ParsedCodexNotification, { kind: "turn_completed" }>,
-  ): void {
+  ): Promise<void> {
     if (parsed.status === "failed") {
       this.emitEvent({
         type: "turn_failed",
@@ -3658,6 +3720,7 @@ class CodexAppServerAgentSession implements AgentSession {
       if (this.planModeEnabled && this.latestPlanResult?.text) {
         this.emitSyntheticPlanApprovalRequest(this.latestPlanResult.text);
       }
+      await this.emitNewGeneratedImageTimelineItems();
       this.emitEvent({
         type: "turn_completed",
         provider: CODEX_PROVIDER,
@@ -4265,6 +4328,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       client.notify("initialized", {});
 
       const limit = options?.limit ?? 20;
+      const includeTimeline = options?.includeTimeline ?? true;
       const response = (await client.request("thread/list", { limit })) as {
         data?: Array<Record<string, unknown>>;
       };
@@ -4275,25 +4339,20 @@ export class CodexAppServerAgentClient implements AgentClient {
           const cwd = typeof thread.cwd === "string" ? thread.cwd : process.cwd();
           const title = typeof thread.preview === "string" ? thread.preview : null;
           let timeline: AgentTimelineItem[] = [];
-          try {
-            const [rolloutTimeline, read] = await Promise.all([
-              loadCodexPersistedTimeline(threadId, undefined, this.logger),
-              client.request("thread/read", {
-                threadId,
-                includeTurns: true,
-              }) as Promise<{ thread?: { turns?: Array<{ items?: unknown[] }> } }>,
-            ]);
-            const turns = read.thread?.turns ?? [];
-            const itemsFromThreadRead: AgentTimelineItem[] = [];
-            for (const turn of turns) {
-              for (const item of turn.items ?? []) {
-                const timelineItem = threadItemToTimeline(item, { cwd });
-                if (timelineItem) itemsFromThreadRead.push(timelineItem);
-              }
+          if (includeTimeline) {
+            try {
+              const [rolloutTimeline, read] = await Promise.all([
+                loadCodexPersistedTimeline(threadId, undefined, this.logger),
+                client.request("thread/read", {
+                  threadId,
+                  includeTurns: true,
+                }) as Promise<{ thread?: { turns?: Array<{ items?: unknown[] }> } }>,
+              ]);
+              const itemsFromThreadRead = codexThreadReadToTimeline(read, cwd);
+              timeline = rolloutTimeline.length > 0 ? rolloutTimeline : itemsFromThreadRead;
+            } catch {
+              timeline = [];
             }
-            timeline = rolloutTimeline.length > 0 ? rolloutTimeline : itemsFromThreadRead;
-          } catch {
-            timeline = [];
           }
 
           return {
