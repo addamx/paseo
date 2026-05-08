@@ -10,7 +10,7 @@ const rootDir = resolve(scriptDir, "..");
 const distDir = resolve(rootDir, "packages/app/dist");
 const indexPath = resolve(distDir, "index.html");
 
-const host = process.env.HOST ?? "127.0.0.1";
+const host = process.env.HOST ?? "0.0.0.0";
 const port = Number(process.env.PORT ?? process.env.PASEO_PORT ?? 4173);
 
 const contentTypes = {
